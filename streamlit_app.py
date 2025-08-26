@@ -1,3 +1,4 @@
+# streamlit_app.py
 import os
 import re
 import requests
@@ -5,8 +6,8 @@ import streamlit as st
 import google.generativeai as genai
 
 # ---------------- Config ----------------
-st.set_page_config(page_title="Reddit Comment Generator")
-MODEL_NAME = "gemini-1.5-flash"  # swap to "gemini-1.5-pro" if needed
+st.set_page_config(page_title="Reddit Comment Generator", page_icon="💬")
+MODEL_NAME = "gemini-1.5-flash"  # swap to "gemini-1.5-pro" if you prefer
 MAX_COMMENTS = 25
 TIMEOUT = 20
 
@@ -18,23 +19,34 @@ if not API_KEY:
 genai.configure(api_key=API_KEY)
 
 # ---------------- Helpers ----------------
-@st.cache_data(show_spinner=False, ttl=600)
-def to_json_url(url: str) -> str:
-    if not re.match(r"^https?://", url):
-        raise ValueError("Enter a full Reddit URL starting with http(s)://")
+def _normalize_to_old_reddit(url: str) -> str:
     base = url.split("?")[0].rstrip("/")
-    return base + ".json"
+    base = base.replace("https://www.reddit.com", "https://old.reddit.com")
+    base = base.replace("https://reddit.com", "https://old.reddit.com")
+    return base
 
 @st.cache_data(show_spinner=False, ttl=600)
 def fetch_thread(url: str):
-    json_url = to_json_url(url)
-    resp = requests.get(
-        json_url,
-        timeout=TIMEOUT,
-        headers={"User-Agent": "streamlit-reddit-commenter/1.0"},
-    )
+    # Normalize URL and call the .json endpoint with a browser-like User-Agent
+    if not re.match(r"^https?://", url):
+        raise ValueError("Enter a full Reddit URL starting with http(s)://")
+
+    base = _normalize_to_old_reddit(url)
+    json_url = base + ".json"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0 Safari/537.36"
+        )
+    }
+
+    resp = requests.get(json_url, timeout=TIMEOUT, headers=headers)
     resp.raise_for_status()
     data = resp.json()
+
+    # data[0] -> post; data[1] -> comments
     post = data[0]["data"]["children"][0]["data"]
     comments_root = data[1]["data"]["children"]
 
@@ -48,9 +60,9 @@ def fetch_thread(url: str):
     for child in comments_root[:MAX_COMMENTS]:
         if child.get("kind") != "t1":
             continue
-        body_c = child["data"].get("body", "")
-        if body_c and body_c != "[deleted]":
-            comments.append(body_c)
+        cbody = child["data"].get("body", "")
+        if cbody and cbody != "[deleted]":
+            comments.append(cbody)
 
     return {
         "title": title,
@@ -63,8 +75,8 @@ def fetch_thread(url: str):
 
 def g_summary_post(model, title, body):
     prompt = (
-        "Summarize the Reddit post for someone who hasn't seen it.\n"
-        "Neutral, 3–5 sentences, keep it tight.\n\n"
+        "Summarize the Reddit post below for someone who hasn't seen it. "
+        "Be neutral, concrete, and brief (3–5 sentences).\n\n"
         f"Title: {title}\n\nBody:\n{body}"
     )
     return (model.generate_content(prompt).text or "").strip()
@@ -72,30 +84,30 @@ def g_summary_post(model, title, body):
 def g_summary_comments(model, comments):
     text = "\n\n".join(comments) if comments else "No comments."
     prompt = (
-        "Summarize the main viewpoints and advice in these Reddit comments.\n"
-        "Group similar opinions; output 4–6 concise bullet points.\n\n"
+        "Summarize the main viewpoints and recurring advice from these Reddit comments. "
+        "Group similar opinions. Output 4–6 short bullet points.\n\n"
         f"{text}"
     )
     return (model.generate_content(prompt).text or "").strip()
 
 def g_generate_reply(model, url, tone, words, post_summary, comments_summary):
-    vibe_instructions = {
-        "Neutral": "balanced, straightforward, conversational.",
-        "Informative": "explanatory with quick facts or steps, still conversational.",
-        "Humorous": "light, dry humor; no snark at the person; no memes or emojis.",
-        "Supportive": "empathetic, encouraging, practical next steps.",
-    }
+    vibe = {
+        "Neutral": "balanced, straightforward, conversational",
+        "Informative": "explanatory with quick facts or steps, still conversational",
+        "Humorous": "light, dry humor; no memes; no mocking the OP",
+        "Supportive": "empathetic, encouraging, practical next steps",
+    }.get(tone, "conversational")
+
     prompt = (
         f"Write a single Reddit-style comment for the thread: {url}\n"
-        f"Tone: {tone} ({vibe_instructions.get(tone, 'conversational')}). "
-        f"Target length ~{words} words.\n"
+        f"Tone: {tone} ({vibe}). Target length ~{words} words.\n"
         "Rules:\n"
-        "- Sound like a normal Reddit user. No marketing, no sales pitch, no corporate voice.\n"
-        "- Keep it natural, direct, specific. Avoid clichés and fluff.\n"
+        "- Sound like a normal Reddit user. No marketing or salesy tone.\n"
+        "- Keep it natural, direct, and specific. Avoid clichés and fluff.\n"
         "- If giving advice, include 2–4 concrete, realistic steps.\n"
         "- No emojis, no hashtags, no links, no disclaimers.\n\n"
         f"POST SUMMARY:\n{post_summary}\n\n"
-        f"COMMENT THEMES:\n{comments_summary}\n\n"
+        f"TOP COMMENT THEMES:\n{comments_summary}\n\n"
         "Now draft the reply."
     )
     return (model.generate_content(prompt).text or "").strip()
@@ -108,15 +120,16 @@ def generate_new_option(permalink, tone, words, post_summary, comments_summary):
 st.title("Reddit Comment Generator")
 
 url = st.text_input("Enter a Reddit post URL")
+
 tone = st.radio(
     "What's the vibe? Choose your comment's tone:",
     ["Neutral", "Informative", "Humorous", "Supportive"],
     index=0,
-    horizontal=False,
 )
+
 length = st.slider("Target length (words)", 50, 220, 100)
 
-# session state to hold summaries and generated options
+# session state
 if "post_summary" not in st.session_state:
     st.session_state.post_summary = ""
 if "comments_summary" not in st.session_state:
@@ -127,13 +140,15 @@ if "replies" not in st.session_state:
     st.session_state.replies = []
 
 col1, col2 = st.columns([1, 1])
-
 with col1:
     fetch_btn = st.button("Fetch & Summarize")
-
 with col2:
-    gen_btn = st.button("Generate Comment", disabled=not bool(st.session_state.post_summary))
+    gen_btn = st.button(
+        "Generate Comment",
+        disabled=not bool(st.session_state.post_summary),
+    )
 
+# Fetch + summarize
 if fetch_btn:
     if not url:
         st.warning("Paste a full Reddit post link.")
@@ -146,10 +161,14 @@ if fetch_btn:
             model = genai.GenerativeModel(MODEL_NAME)
 
             with st.spinner("Summarizing post..."):
-                st.session_state.post_summary = g_summary_post(model, thread["title"], thread["body"])
+                st.session_state.post_summary = g_summary_post(
+                    model, thread["title"], thread["body"]
+                )
 
             with st.spinner("Summarizing comments..."):
-                st.session_state.comments_summary = g_summary_comments(model, thread["comments"])
+                st.session_state.comments_summary = g_summary_comments(
+                    model, thread["comments"]
+                )
 
             st.success("Summaries ready. Now generate a comment.")
             st.session_state.replies = []  # reset previous results
@@ -158,12 +177,14 @@ if fetch_btn:
         except Exception as e:
             st.error(f"Something broke: {e}")
 
+# Show summaries if available
 if st.session_state.post_summary:
     with st.expander("Post Summary", expanded=True):
         st.write(st.session_state.post_summary or "No content to summarize.")
     with st.expander("Comments Summary", expanded=True):
         st.write(st.session_state.comments_summary or "No comments to summarize.")
 
+# Generate one or more replies
 if gen_btn:
     reply = generate_new_option(
         st.session_state.permalink,
@@ -179,7 +200,6 @@ if st.session_state.replies:
     st.markdown("### Suggested Comments")
     for i, r in enumerate(st.session_state.replies, 1):
         st.markdown(f"**Option {i}:**\n\n{r}\n")
-    # Generate another fresh option
     if st.button("Generate Another"):
         reply = generate_new_option(
             st.session_state.permalink,
