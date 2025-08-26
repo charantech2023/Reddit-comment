@@ -2,46 +2,70 @@
 import os
 import re
 import time
-import streamlit as st
 import requests
+import streamlit as st
 import google.generativeai as genai
 import praw
 from prawcore.exceptions import ResponseException, OAuthException
 
-# ---------------- Config ----------------
+# ---------------- App config ----------------
 st.set_page_config(page_title="Reddit Comment Generator", page_icon="💬")
-MODEL_NAME = "gemini-1.5-flash"
+MODEL_NAME = "gemini-1.5-flash"  # or "gemini-1.5-pro"
 MAX_COMMENTS = 25
 
-# ---------------- API Keys ----------------
-GEMINI_KEY = os.environ.get("GOOGLE_API_KEY")
+# ---------------- Secrets helper ----------------
+def _get_secret(name, default=None):
+    # Prefer Streamlit secrets, fall back to env for local runs
+    return st.secrets.get(name) or os.environ.get(name, default)
+
+# ---------------- Keys ----------------
+GEMINI_KEY = _get_secret("GOOGLE_API_KEY")
 if not GEMINI_KEY:
     st.error("Missing GOOGLE_API_KEY. Add it in Manage app → Settings → Secrets.")
     st.stop()
 genai.configure(api_key=GEMINI_KEY)
 
-# ---------------- Reddit Auth ----------------
+# ---------------- Reddit auth (diagnostic) ----------------
 def _init_reddit():
+    rid = _get_secret("REDDIT_CLIENT_ID")
+    rsec = _get_secret("REDDIT_CLIENT_SECRET")
+    rua = _get_secret("REDDIT_USER_AGENT")
+
+    # Fail early with clear messages
+    missing = [k for k, v in [
+        ("REDDIT_CLIENT_ID", rid),
+        ("REDDIT_CLIENT_SECRET", rsec),
+        ("REDDIT_USER_AGENT", rua),
+    ] if not v]
+    if missing:
+        raise RuntimeError(
+            f"Missing secrets: {', '.join(missing)}. "
+            "Add them in Streamlit → Manage app → Settings → Secrets."
+        )
+
     try:
         reddit = praw.Reddit(
-            client_id=os.environ.get("REDDIT_CLIENT_ID"),
-            client_secret=os.environ.get("REDDIT_CLIENT_SECRET"),
-            user_agent=os.environ.get("REDDIT_USER_AGENT", "comment-generator/1.0"),
+            client_id=rid,
+            client_secret=rsec,
+            user_agent=rua,
             check_for_async=False,
         )
         reddit.read_only = True
-        # Sanity check to force auth usage
+        # Force a tiny authenticated call; raises on bad creds
         _ = reddit.subreddit("all").display_name
         return reddit
     except OAuthException as e:
         raise RuntimeError(
-            "Reddit OAuth failed. Double-check CLIENT_ID / CLIENT_SECRET / USER_AGENT. "
-            "Use the short ID under the app name, not the app name itself."
+            "Reddit OAuth failed (401). Fix one of these:\n"
+            "• App type must be 'script' at reddit.com/prefs/apps.\n"
+            "• client_id must be the SHORT id under the app name (not the app name).\n"
+            "• client_secret must be the LONG secret from the app page.\n"
+            "• user-agent must be like: 'script:comment-generator:1.0 (by /u/YourUser)'."
         ) from e
     except ResponseException as e:
         raise RuntimeError(f"Reddit API refused the request: {e}") from e
 
-# ---------------- Fetch Thread ----------------
+# ---------------- Fetch thread via Reddit API ----------------
 @st.cache_data(show_spinner=False, ttl=600)
 def fetch_thread(url: str):
     if not re.match(r"^https?://", url or ""):
@@ -49,6 +73,8 @@ def fetch_thread(url: str):
 
     reddit = _init_reddit()
     submission = reddit.submission(url=url)
+
+    # Flatten top-level comments
     submission.comments.replace_more(limit=0)
     top_level = submission.comments[:MAX_COMMENTS]
 
@@ -67,10 +93,10 @@ def fetch_thread(url: str):
         "comments": comments,
     }
 
-# ---------------- Gemini Helpers ----------------
+# ---------------- Gemini helpers ----------------
 def g_summary_post(model, title, body):
     prompt = (
-        "Summarize the Reddit post below in 3–5 sentences. Neutral tone.\n\n"
+        "Summarize the Reddit post below in 3–5 sentences. Neutral, specific.\n\n"
         f"Title: {title}\n\nBody:\n{body}"
     )
     return (model.generate_content(prompt).text or "").strip()
@@ -88,7 +114,7 @@ def g_generate_reply(model, url, tone, words, post_summary, comments_summary):
     vibe = {
         "Neutral": "balanced, conversational",
         "Informative": "explains with 2–4 concrete steps or facts",
-        "Humorous": "light humor; no emojis, no memes",
+        "Humorous": "light, dry humor; no emojis or memes",
         "Supportive": "empathetic, encouraging, practical",
     }.get(tone, "conversational")
 
@@ -96,8 +122,9 @@ def g_generate_reply(model, url, tone, words, post_summary, comments_summary):
         f"Write a Reddit-style comment for the thread: {url}\n"
         f"Tone: {tone} ({vibe}). Target length ~{words} words.\n"
         "Guidelines:\n"
-        "- Sound like a normal Reddit user; avoid marketing.\n"
-        "- Keep it natural, direct, specific.\n"
+        "- Sound like a normal Reddit user; no marketing or salesy tone.\n"
+        "- Keep it natural, direct, specific. Avoid clichés and fluff.\n"
+        "- If advising, include 2–4 realistic steps.\n"
         "- No emojis, hashtags, links, or disclaimers.\n\n"
         f"POST SUMMARY:\n{post_summary}\n\n"
         f"COMMENT THEMES:\n{comments_summary}\n\n"
