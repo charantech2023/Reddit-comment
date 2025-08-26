@@ -18,103 +18,108 @@ if not API_KEY:
     st.stop()
 genai.configure(api_key=API_KEY)
 
-# ---------------- Helpers ----------------
-def _normalize_to_old_reddit(url: str) -> str:
-    base = url.split("?")[0].rstrip("/")
-    base = base.replace("https://www.reddit.com", "https://old.reddit.com")
-    base = base.replace("https://reddit.com", "https://old.reddit.com")
-    return base
+# ---------------- Helpers ----------------import json
+import time
 
 @st.cache_data(show_spinner=False, ttl=600)
 def fetch_thread(url: str):
-    # Normalize URL and call the .json endpoint with a browser-like User-Agent
+    # 1) Normalize URL to old.reddit.com and build .json endpoints
     if not re.match(r"^https?://", url):
         raise ValueError("Enter a full Reddit URL starting with http(s)://")
+    base = url.split("?")[0].rstrip("/")
+    base = base.replace("https://www.reddit.com", "https://old.reddit.com")
+    base = base.replace("https://reddit.com", "https://old.reddit.com")
 
-    base = _normalize_to_old_reddit(url)
-    json_url = base + ".json"
+    json_urls = [
+        base + ".json?raw_json=1",  # richer text formatting
+        base + ".json",             # fallback
+    ]
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/122.0 Safari/537.36"
-        )
+    # 2) Two realistic browser headers to rotate if blocked
+    chrome_headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/122.0 Safari/537.36"),
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://old.reddit.com/",
+        "Connection": "keep-alive",
+        "DNT": "1",
+    }
+    firefox_headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) "
+                       "Gecko/20100101 Firefox/123.0"),
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://old.reddit.com/",
+        "Connection": "keep-alive",
+        "DNT": "1",
     }
 
-    resp = requests.get(json_url, timeout=TIMEOUT, headers=headers)
-    resp.raise_for_status()
-    data = resp.json()
+    def try_fetch(hdrs):
+        last_err = None
+        for ju in json_urls:
+            try:
+                resp = requests.get(ju, headers=hdrs, timeout=TIMEOUT, allow_redirects=True)
+                # Reddit sometimes 200s with HTML. Reject non-JSON quickly.
+                ct = resp.headers.get("Content-Type", "")
+                if "json" not in ct:
+                    # Try to parse anyway; if it explodes, we treat as failure.
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        last_err = RuntimeError(f"Non-JSON response ({ct}) for {ju}")
+                        continue
+                else:
+                    data = resp.json()
 
-    # data[0] -> post; data[1] -> comments
-    post = data[0]["data"]["children"][0]["data"]
-    comments_root = data[1]["data"]["children"]
+                # Expected structure: [post, comments]
+                if not isinstance(data, list) or len(data) < 2:
+                    last_err = RuntimeError("Unexpected JSON shape from Reddit")
+                    continue
 
-    title = post.get("title", "")
-    body = post.get("selftext", "")
-    permalink = "https://www.reddit.com" + post.get("permalink", "")
-    subreddit = post.get("subreddit_name_prefixed", "")
-    author = post.get("author", "[deleted]")
+                post = data[0]["data"]["children"][0]["data"]
+                comments_root = data[1]["data"]["children"]
 
-    comments = []
-    for child in comments_root[:MAX_COMMENTS]:
-        if child.get("kind") != "t1":
-            continue
-        cbody = child["data"].get("body", "")
-        if cbody and cbody != "[deleted]":
-            comments.append(cbody)
+                title = post.get("title", "")
+                body = post.get("selftext", "")
+                permalink = "https://www.reddit.com" + post.get("permalink", "")
+                subreddit = post.get("subreddit_name_prefixed", "")
+                author = post.get("author", "[deleted]")
 
-    return {
-        "title": title,
-        "body": body,
-        "permalink": permalink,
-        "subreddit": subreddit,
-        "author": author,
-        "comments": comments,
-    }
+                comments = []
+                for child in comments_root[:MAX_COMMENTS]:
+                    if child.get("kind") != "t1":
+                        continue
+                    cbody = child["data"].get("body", "")
+                    if cbody and cbody != "[deleted]":
+                        comments.append(cbody)
 
-def g_summary_post(model, title, body):
-    prompt = (
-        "Summarize the Reddit post below for someone who hasn't seen it. "
-        "Be neutral, concrete, and brief (3–5 sentences).\n\n"
-        f"Title: {title}\n\nBody:\n{body}"
-    )
-    return (model.generate_content(prompt).text or "").strip()
+                return {
+                    "title": title,
+                    "body": body,
+                    "permalink": permalink,
+                    "subreddit": subreddit,
+                    "author": author,
+                    "comments": comments,
+                }
+            except requests.HTTPError as e:
+                last_err = e
+                continue
+            except Exception as e:
+                last_err = e
+                continue
+        raise last_err or RuntimeError("Failed to fetch Reddit thread")
 
-def g_summary_comments(model, comments):
-    text = "\n\n".join(comments) if comments else "No comments."
-    prompt = (
-        "Summarize the main viewpoints and recurring advice from these Reddit comments. "
-        "Group similar opinions. Output 4–6 short bullet points.\n\n"
-        f"{text}"
-    )
-    return (model.generate_content(prompt).text or "").strip()
+    # 3) First try with Chrome UA, then retry with Firefox UA
+    try:
+        return try_fetch(chrome_headers)
+    except Exception:
+        time.sleep(0.5)
+        return try_fetch(firefox_headers)
 
-def g_generate_reply(model, url, tone, words, post_summary, comments_summary):
-    vibe = {
-        "Neutral": "balanced, straightforward, conversational",
-        "Informative": "explanatory with quick facts or steps, still conversational",
-        "Humorous": "light, dry humor; no memes; no mocking the OP",
-        "Supportive": "empathetic, encouraging, practical next steps",
-    }.get(tone, "conversational")
-
-    prompt = (
-        f"Write a single Reddit-style comment for the thread: {url}\n"
-        f"Tone: {tone} ({vibe}). Target length ~{words} words.\n"
-        "Rules:\n"
-        "- Sound like a normal Reddit user. No marketing or salesy tone.\n"
-        "- Keep it natural, direct, and specific. Avoid clichés and fluff.\n"
-        "- If giving advice, include 2–4 concrete, realistic steps.\n"
-        "- No emojis, no hashtags, no links, no disclaimers.\n\n"
-        f"POST SUMMARY:\n{post_summary}\n\n"
-        f"TOP COMMENT THEMES:\n{comments_summary}\n\n"
-        "Now draft the reply."
-    )
-    return (model.generate_content(prompt).text or "").strip()
-
-def generate_new_option(permalink, tone, words, post_summary, comments_summary):
-    model = genai.GenerativeModel(MODEL_NAME)
-    return g_generate_reply(model, permalink, tone, words, post_summary, comments_summary)
 
 # ---------------- UI ----------------
 st.title("Reddit Comment Generator")
