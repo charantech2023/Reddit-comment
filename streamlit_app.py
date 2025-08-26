@@ -6,10 +6,11 @@ import streamlit as st
 import requests
 import google.generativeai as genai
 import praw
+from prawcore.exceptions import ResponseException, OAuthException
 
 # ---------------- Config ----------------
 st.set_page_config(page_title="Reddit Comment Generator", page_icon="💬")
-MODEL_NAME = "gemini-1.5-flash"  # or "gemini-1.5-pro"
+MODEL_NAME = "gemini-1.5-flash"
 MAX_COMMENTS = 25
 
 # ---------------- API Keys ----------------
@@ -19,30 +20,35 @@ if not GEMINI_KEY:
     st.stop()
 genai.configure(api_key=GEMINI_KEY)
 
-REDDIT_ID = os.environ.get("REDDIT_CLIENT_ID")
-REDDIT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET")
-REDDIT_UA = os.environ.get("REDDIT_USER_AGENT", "streamlit-reddit-commenter/1.0")
+# ---------------- Reddit Auth ----------------
+def _init_reddit():
+    try:
+        reddit = praw.Reddit(
+            client_id=os.environ.get("REDDIT_CLIENT_ID"),
+            client_secret=os.environ.get("REDDIT_CLIENT_SECRET"),
+            user_agent=os.environ.get("REDDIT_USER_AGENT", "comment-generator/1.0"),
+            check_for_async=False,
+        )
+        reddit.read_only = True
+        # Sanity check to force auth usage
+        _ = reddit.subreddit("all").display_name
+        return reddit
+    except OAuthException as e:
+        raise RuntimeError(
+            "Reddit OAuth failed. Double-check CLIENT_ID / CLIENT_SECRET / USER_AGENT. "
+            "Use the short ID under the app name, not the app name itself."
+        ) from e
+    except ResponseException as e:
+        raise RuntimeError(f"Reddit API refused the request: {e}") from e
 
-if not (REDDIT_ID and REDDIT_SECRET and REDDIT_UA):
-    st.error("Missing Reddit API secrets. Set REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USER_AGENT in Secrets.")
-    st.stop()
-
-# ---------------- Fetch via PRAW (official API) ----------------
+# ---------------- Fetch Thread ----------------
 @st.cache_data(show_spinner=False, ttl=600)
 def fetch_thread(url: str):
     if not re.match(r"^https?://", url or ""):
         raise ValueError("Enter a full Reddit URL starting with http(s)://")
 
-    reddit = praw.Reddit(
-        client_id=REDDIT_ID,
-        client_secret=REDDIT_SECRET,
-        user_agent=REDDIT_UA,
-        check_for_async=False,
-    )
-
+    reddit = _init_reddit()
     submission = reddit.submission(url=url)
-
-    # Flatten comments and slice
     submission.comments.replace_more(limit=0)
     top_level = submission.comments[:MAX_COMMENTS]
 
@@ -61,11 +67,10 @@ def fetch_thread(url: str):
         "comments": comments,
     }
 
-# ---------------- Gemini helpers ----------------
+# ---------------- Gemini Helpers ----------------
 def g_summary_post(model, title, body):
     prompt = (
-        "Summarize the Reddit post below for someone who hasn't seen it. "
-        "Be neutral, specific, and brief (3–5 sentences).\n\n"
+        "Summarize the Reddit post below in 3–5 sentences. Neutral tone.\n\n"
         f"Title: {title}\n\nBody:\n{body}"
     )
     return (model.generate_content(prompt).text or "").strip()
@@ -83,7 +88,7 @@ def g_generate_reply(model, url, tone, words, post_summary, comments_summary):
     vibe = {
         "Neutral": "balanced, conversational",
         "Informative": "explains with 2–4 concrete steps or facts",
-        "Humorous": "light, dry humor; no emojis, no memes",
+        "Humorous": "light humor; no emojis, no memes",
         "Supportive": "empathetic, encouraging, practical",
     }.get(tone, "conversational")
 
@@ -91,9 +96,8 @@ def g_generate_reply(model, url, tone, words, post_summary, comments_summary):
         f"Write a Reddit-style comment for the thread: {url}\n"
         f"Tone: {tone} ({vibe}). Target length ~{words} words.\n"
         "Guidelines:\n"
-        "- Sound like a normal Reddit user; avoid marketing/salesy language.\n"
-        "- Keep it natural, direct, specific. Avoid clichés and fluff.\n"
-        "- If advising, include 2–4 realistic steps.\n"
+        "- Sound like a normal Reddit user; avoid marketing.\n"
+        "- Keep it natural, direct, specific.\n"
         "- No emojis, hashtags, links, or disclaimers.\n\n"
         f"POST SUMMARY:\n{post_summary}\n\n"
         f"COMMENT THEMES:\n{comments_summary}\n\n"
