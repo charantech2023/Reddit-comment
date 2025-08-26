@@ -1,0 +1,5 @@
+{
+  "name": "Reddit Comment Generator",
+  "description": "An app that generates non-salesy comments for Reddit links using AI.",
+  "requestFramePermissions": []
+}
